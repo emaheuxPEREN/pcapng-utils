@@ -4,7 +4,7 @@ from functools import cached_property
 from typing import Sequence, Mapping, ClassVar, Optional, Any
 
 from ..types import HarEntry, DictLayers, NameValueDict
-from ..utils import Payload, get_tshark_bytes_from_raw
+from ..utils import Payload, get_tshark_bytes_from_raw, ContentEncodedKey, get_tshark_content_encoded_key_value, get_consistent_http_content_length
 
 
 class Http2Substream:
@@ -75,7 +75,7 @@ class Http2RequestResponse:
 
     def __init__(self, substreams: list[Http2Substream]):
         self.substreams = substreams
-        self.headers, self.data, self.headers_streams, self.data_streams = Http2Helper.get_headers_and_data(substreams)
+        self.headers, (self.data, self.content_encoded_key), self.headers_streams, self.data_streams = Http2Helper.get_headers_and_data(substreams)
 
     def __bool__(self) -> bool:
         return bool(self.substreams)
@@ -96,19 +96,27 @@ class Http2RequestResponse:
     def body_length(self) -> int:
         """
         <!> This is number of compressed bytes (if any compression)
-        - `http2.length` is also populated for header substreams
+        - `http2.length` is also populated for header substreams (i.e. we MUST discard them in sum)
         - we do NOT always have the `http2.body.fragments` -> `http2.body.reassembled.length`
         """
         if not self:
             return -1
         declared_size = sum(int(s.raw_http2_substream.get('http2.length', 0)) for s in self.data_streams)
-        if declared_size != self.data.size and self.headers_map.get('content-encoding', 'identity') == 'identity':
+        try:
+            encoded_length, _ = get_consistent_http_content_length(
+                self.headers_map,
+                declared_size,
+                self.content_encoded_key,
+                self.data.size,
+            )
+            return encoded_length
+        except (AssertionError, NotImplementedError) as e:
+            raise ValueError(str(self)) from e
             warnings.warn(
-                f"Content length mismatch despite no compression: "
-                f"declared ({declared_size}) != computed ({self.data.size})"
+                f"HTTP2 content length seems not consistent: using computed ({self.data.size})"
                 f"\n{self}"
             )
-        return declared_size
+            return self.data.size
 
     @cached_property
     def headers_map(self) -> dict[str, str]:
@@ -249,33 +257,38 @@ class Http2Stream:
         }
 
     @staticmethod
-    def _get_raw_data_one_substream(raw_http2_substream: Mapping[str, Any]) -> Payload:
+    def _get_raw_data_one_substream(
+        raw_http2_substream: Mapping[str, Any],
+        allow_tshark_decoded_content: bool = True,
+    ) -> tuple[Payload, ContentEncodedKey | None]:
         """
         Notes:
         - when dealing with a reassembled data substream, `http2.data.data_raw` MAY not contain all data
-        - if the payload was compressed, tshark decompresses ALL data for us(even if data is reassembled)
+        - if the payload was compressed, tshark decompresses ALL data for us (even if data is reassembled)
         under `Content-encoded entity body ...` -> `http2.data.data_raw` key, so we check it first
         """
-        for k, v in raw_http2_substream.items():
-            if k.lower().startswith('content-encoded entity body '):
-                assert isinstance(v, dict), (k, v)
-                if 'http2.data.data_raw' not in v:
-                    if 'data_raw' in v:  # special case for failed decompression (not observed but as http protocol?!)
-                        return Payload.from_tshark_raw(v['data_raw'])
-                    # also happens in special case of empty decompressed payload (observed)
-                    assert v['http2.data.data'] == '', v
-                return Payload.from_tshark_raw(v.get('http2.data.data_raw'))
+        content_encoded_key, content_encoded_dict = get_tshark_content_encoded_key_value(raw_http2_substream)
+        if content_encoded_dict is not None:
+            if not allow_tshark_decoded_content:
+                raise NotImplementedError(f'Unhandled HTTP2 data segment containing data decoded by tshark: {content_encoded_dict}')
+            assert isinstance(content_encoded_dict, dict), content_encoded_dict
+            if 'http2.data.data_raw' not in content_encoded_dict:
+                if 'data_raw' in content_encoded_dict:  # special case for failed decompression (not observed but as in http protocol?!)
+                    return Payload.from_tshark_raw(content_encoded_dict['data_raw']), content_encoded_key
+                # needed for special case of empty decompressed payload (observed case)
+                assert content_encoded_dict['http2.data.data'] == '', content_encoded_dict
+            return Payload.from_tshark_raw(content_encoded_dict.get('http2.data.data_raw')), content_encoded_key
         if 'http2.body.fragments' in raw_http2_substream:
-            return Payload.from_tshark_raw(raw_http2_substream['http2.body.fragments']['http2.body.reassembled.data_raw'])
-        return Payload.from_tshark_raw(raw_http2_substream.get('http2.data.data_raw'))
+            return Payload.from_tshark_raw(raw_http2_substream['http2.body.fragments']['http2.body.reassembled.data_raw']), None
+        return Payload.from_tshark_raw(raw_http2_substream.get('http2.data.data_raw')), None
 
     @classmethod
-    def get_raw_data(cls, raw_http2_substreams: Sequence[Mapping[str, Any]]) -> Payload:
+    def get_raw_data(cls, raw_http2_substreams: Sequence[Mapping[str, Any]]) -> tuple[Payload, ContentEncodedKey | None]:
         """
         Find the data in the substreams.
 
         :param raw_http2_substreams: the data substreams to be analyzed
-        :return: the raw reassembled data if it exists, otherwise an empty Payload
+        :return: the reassembled payload data, together with ContentEncodedKey if any
         """
         # 1) search for the unique substream with reassembled data if present
         substreams_reassembled = {
@@ -289,9 +302,12 @@ class Http2Stream:
             #assert substream_reassembled['http2.flags'] & 0x01, substream_reassembled
             assert ix_reassembled == len(raw_http2_substreams) - 1, raw_http2_substreams
             return cls._get_raw_data_one_substream(substream_reassembled)
-        # 2) if there is none (which happens) we manually concatenate fragments
+        # 2) if there is none (which happens) we manually concatenate fragments if multiple
         # <!> decompression for overall content is NOT implemented (should not happen?!)
-        return Payload.concat(*(cls._get_raw_data_one_substream(ss) for ss in raw_http2_substreams))
+        if len(raw_http2_substreams) == 1:
+            return cls._get_raw_data_one_substream(raw_http2_substreams[0])
+        payloads = [cls._get_raw_data_one_substream(ss, allow_tshark_decoded_content=False)[0] for ss in raw_http2_substreams]
+        return Payload.concat(*payloads), None
 
     def process(self) -> None:
         """
@@ -380,7 +396,7 @@ class Http2Helper:
             'queryString': [],  # TODO?
             'cookies': [],  # TODO?
             'headersSize': message.header_length,
-            'bodySize': message.body_length,
+            'bodySize': message.body_length,  # <!> may be != 0 while no actual data (e.g. empty gzip payload)
         }
         if isinstance(message, Http2Request):
             entry['method'] = message.http_method
@@ -402,7 +418,7 @@ class Http2Helper:
         return entry
 
     @staticmethod
-    def get_data(data_substreams: Sequence[Http2Substream]) -> Payload:
+    def get_data(data_substreams: Sequence[Http2Substream]):
         """
         Extract the data from the substreams (precondition: all substreams are data substreams).
 

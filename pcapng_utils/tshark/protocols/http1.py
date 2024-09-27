@@ -1,3 +1,4 @@
+import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from functools import cached_property
@@ -5,7 +6,7 @@ from dataclasses import dataclass
 from typing import Sequence, ClassVar, Any
 
 from ..types import HarEntry, DictLayers
-from ..utils import Payload, get_layers_mapping, get_tshark_bytes_from_raw
+from ..utils import Payload, get_layers_mapping, get_tshark_bytes_from_raw, get_tshark_content_encoded_key_value, get_consistent_http_content_length
 
 HTTP_METHODS = {'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'CONNECT', 'TRACE'}
 
@@ -53,19 +54,37 @@ class HttpRequestResponse(ABC):
         return self.http_layer.get('http.content_type', self.FALLBACK_CONTENT_TYPE)
 
     @cached_property
+    def content_encoded_key_value(self):
+        return get_tshark_content_encoded_key_value(self.http_layer)
+
+    @cached_property
     def payload(self) -> Payload:
         raw_data = self.http_layer.get('http.file_data_raw')
         if raw_data is None:
             # handle tshark error during decompression
-            for k, v in self.http_layer.items():
-                if k.lower().startswith('content-encoded entity body ') and isinstance(v, dict):
-                    raw_data = v['data_raw']
-                    break
+            _, failed_decoding = self.content_encoded_key_value
+            if isinstance(failed_decoding, dict):  # empty str when decoding is OK
+                raw_data = failed_decoding['data_raw']
         return Payload.from_tshark_raw(raw_data)
 
     @property
     def content_length(self) -> int:
-        return self.payload.size
+        """<!> This is number of compressed bytes (if any compression)"""
+        try:
+            encoded_length, _ = get_consistent_http_content_length(
+                self.headers_map,
+                self.http_layer.get('http.content_length_header'),
+                self.content_encoded_key_value[0],
+                self.payload.size,
+            )
+            return encoded_length
+        except (AssertionError, NotImplementedError) as e:
+            raise ValueError(self.headers_map) from e
+            warnings.warn(
+                f"HTTP1 content length seems not consistent: using computed ({self.payload.size})"
+                f"\n{self.headers_map}"
+            )
+            return self.payload.size
 
     @property
     def started_date(self) -> str:
@@ -85,6 +104,13 @@ class HttpRequestResponse(ABC):
                 'value': value.strip(),
             })
         return processed_headers
+
+    @cached_property
+    def headers_map(self) -> dict[str, str]:
+        return {
+            h['name'].lower(): h['value']
+            for h in self.headers
+        }
 
 
 @dataclass(frozen=True)
@@ -133,7 +159,7 @@ class HttpRequest(HttpRequestResponse):
             'headersSize': self.header_length,
             'bodySize': self.content_length,
         }
-        if self.content_length:
+        if self.content_length:  # <!> may be != 0 while no actual data (e.g. empty gzip payload)
             d['postData'] = {
                 'mimeType': self.content_type,
                 **self.payload.to_har_dict(),
