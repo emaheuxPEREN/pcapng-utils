@@ -71,6 +71,8 @@ def pcapng_to_har(
     # Save the HAR file
     traffic.save_har(output_file, overwrite=overwrite, **json_dump_kws)
 
+    print(f"{input_file} -> {output_file}: success")
+
 
 if __name__ == "__main__":
     cli()

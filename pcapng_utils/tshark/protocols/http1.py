@@ -1,13 +1,11 @@
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
 from functools import cached_property
 from dataclasses import dataclass
-from typing import Sequence, ClassVar, Any
+from typing import Sequence, Any
 
 from ..types import HarEntry, DictLayers
 from ..utils import Payload, get_layers_mapping, get_tshark_bytes_from_raw
-
-HTTP_METHODS = {'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'CONNECT', 'TRACE'}
+from .http_base import BaseHttpRequestResponse, BaseHttpRequest, BaseHttpResponse, HTTP_METHODS
 
 
 def _get_raw_headers(http_layer: dict[str, Any], direction: str) -> list[bytes]:
@@ -20,22 +18,14 @@ def _get_raw_headers(http_layer: dict[str, Any], direction: str) -> list[bytes]:
 
 
 @dataclass(frozen=True)
-class HttpRequestResponse(ABC):
+class Http1RequestResponse(BaseHttpRequestResponse, ABC):
     """
     Base class for HTTP request and response packets. It wraps the packet data and provides methods to
     access the relevant information.
     """
-    packet: DictLayers
-
-    FALLBACK_CONTENT_TYPE: ClassVar = 'application/octet-stream'
-
-    @property
-    def community_id(self) -> str:
-        return self.packet['communityid']
-
     @property
     def http_layer(self) -> dict[str, Any]:
-        return self.packet['http']
+        return self.packet_layers['http']
 
     @property
     @abstractmethod
@@ -53,7 +43,7 @@ class HttpRequestResponse(ABC):
         return self.http_layer.get('http.content_type', self.FALLBACK_CONTENT_TYPE)
 
     @cached_property
-    def payload(self) -> Payload:
+    def payload(self) -> Payload:  # type: ignore[overriding]
         raw_data = self.http_layer.get('http.file_data_raw')
         if raw_data is None:
             # handle tshark error during decompression
@@ -65,12 +55,7 @@ class HttpRequestResponse(ABC):
 
     @property
     def content_length(self) -> int:
-        return self.payload.size
-
-    @property
-    def started_date(self) -> str:
-        frame_time: str = self.packet['frame']['frame.time_epoch']
-        return datetime.fromtimestamp(float(frame_time), timezone.utc).isoformat()
+        return self.payload.size  # TODO: should be encoded size
 
     @cached_property
     def headers(self) -> list[dict[str, str]]:
@@ -88,7 +73,7 @@ class HttpRequestResponse(ABC):
 
 
 @dataclass(frozen=True)
-class HttpRequest(HttpRequestResponse):
+class Http1Request(Http1RequestResponse, BaseHttpRequest):
     """
     Class to represent an HTTP request.
     """
@@ -114,7 +99,7 @@ class HttpRequest(HttpRequestResponse):
 
     @property
     def sending_duration(self) -> float:
-        return round(1000 * float(self.packet['frame'].get('frame.time_delta', 0)), 2)
+        return round(1000 * float(self.packet_layers['frame'].get('frame.time_delta', 0)), 2)
 
     def to_har(self) -> dict[str, Any]:
         """
@@ -134,6 +119,7 @@ class HttpRequest(HttpRequestResponse):
             'bodySize': self.content_length,
         }
         if self.content_length:
+            # TODO: mutualize code from HTTP2 (with _content)
             d['postData'] = {
                 'mimeType': self.content_type,
                 **self.payload.to_har_dict(),
@@ -144,25 +130,9 @@ class HttpRequest(HttpRequestResponse):
     def uri(self) -> str:
         return self.http_layer['http.request.full_uri']
 
-    @property
-    def src_host(self) -> str:
-        return self.packet['ip'].get('ip.src_host', '')
-
-    @property
-    def dst_host(self) -> str:
-        return self.packet['ip'].get('ip.dst_host', '')
-
-    @property
-    def src_ip(self) -> str:
-        return self.packet['ip']['ip.src']
-
-    @property
-    def dst_ip(self) -> str:
-        return self.packet['ip']['ip.dst']
-
 
 @dataclass(frozen=True)
-class HttpResponse(HttpRequestResponse):
+class Http1Response(Http1RequestResponse, BaseHttpResponse):
     """
     Class to represent an HTTP response.
     """
@@ -184,7 +154,7 @@ class HttpResponse(HttpRequestResponse):
             return version, int(d['http.response.code']), d['http.response.code.desc']
         return 'HTTP/1.1', 0, ''
 
-    def to_har(self):
+    def to_har(self) -> dict[str, Any]:
         """
         Convert the HTTP response to HTTP Archive (HAR) format.
         :return: the HTTP response in HAR format
@@ -210,13 +180,13 @@ class HttpResponse(HttpRequestResponse):
         return round(1000 * float(self.http_layer.get('http.time', 0)), 2)
 
 
-class HttpConversation:
+class Http1Conversation:
     """
     Class to represent an HTTP conversation composed of a request and a response.
     """
     def __init__(self, request_layers: DictLayers, response_layers: DictLayers):
-        self.request = HttpRequest(request_layers)
-        self.response = HttpResponse(response_layers)
+        self.request = Http1Request(request_layers)
+        self.response = Http1Response(response_layers)
 
     @property
     def community_id(self) -> str:
@@ -226,12 +196,12 @@ class HttpConversation:
 
     @property
     def request_timestamp(self) -> float:
-        return float(self.request.packet['frame']['frame.time_epoch'])
+        return float(self.request.packet_layers['frame']['frame.time_epoch'])
 
     @property
     def waiting_duration(self) -> float:
         start_time = self.request_timestamp
-        stop_time = float(self.response.packet['frame']['frame.time_epoch'])
+        stop_time = float(self.response.packet_layers['frame']['frame.time_epoch'])
         return round(1000 * (stop_time - start_time), 2)
 
     def to_har(self) -> dict[str, Any]:
@@ -284,7 +254,7 @@ class Http1Traffic:
     """
     def __init__(self, traffic: Sequence[DictLayers]):
         self.traffic = traffic
-        self.conversations: list[HttpConversation] = []
+        self.conversations: list[Http1Conversation] = []
         self.parse_traffic()
 
     def parse_traffic(self) -> None:
@@ -315,7 +285,7 @@ class Http1Traffic:
                 continue
             # This is a request
             response_layers = layers_mapping[int(http_layer['http.response_in'])]
-            self.conversations.append(HttpConversation(request_layers, response_layers))
+            self.conversations.append(Http1Conversation(request_layers, response_layers))
 
     def get_har_entries(self) -> list[HarEntry]:
         """

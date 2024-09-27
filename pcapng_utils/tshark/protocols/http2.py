@@ -1,25 +1,30 @@
 import warnings
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from functools import cached_property
-from typing import Sequence, Mapping, ClassVar, Optional, Any
+from typing import Sequence, Mapping, ClassVar, Optional, Self, Any
 
 from ..types import HarEntry, DictLayers, NameValueDict
 from ..utils import Payload, get_tshark_bytes_from_raw
+from .http_base import BaseHttpRequestResponse, BaseHttpRequest, BaseHttpResponse, HTTP_METHODS
 
 
-class Http2Substream:
+@dataclass(frozen=True)
+class Http2Substream(BaseHttpRequestResponse):
     """
     Class to represent a HTTP2 substream. It contains the layers of the packet and the metadata of the substream.
     Wrap the raw HTTP2 substream and the frame layers to extract the relevant information.
     """
+    raw_http2_substream: dict[str, Any]
+
     KEEP_LAYERS: ClassVar = {'ip', 'frame'}
 
-    def __init__(self, raw_http2_substream: dict[str, Any], all_layers: DictLayers):
-        self.packet_layers: dict[str, Any] = {}
-        for layer, data in all_layers.items():
-            if layer in self.KEEP_LAYERS:
-                self.packet_layers[layer] = data
-        self.raw_http2_substream = raw_http2_substream
+    @classmethod
+    def from_full_layers(cls, raw_http2_substream: dict[str, Any], full_layers: DictLayers) -> Self:
+        filtered_packet_layers: dict[str, Any] = {}
+        for layer, data in full_layers.items():
+            if layer in cls.KEEP_LAYERS:
+                filtered_packet_layers[layer] = data
+        return cls(full_layers, raw_http2_substream)
 
     @property
     def http2_flags(self) -> int:
@@ -30,49 +35,18 @@ class Http2Substream:
         return int(self.raw_http2_substream.get('http2.type', -1))
 
     @property
-    def ip_layer(self) -> dict[str, Any]:
-        return self.packet_layers['ip']
-
-    @property
-    def frame_layer(self) -> dict[str, Any]:
-        return self.packet_layers['frame']
-
-    @property
-    def src_host(self) -> str:
-        return self.ip_layer.get('ip.src_host', '')
-
-    @property
-    def dst_host(self) -> str:
-        return self.ip_layer.get('ip.dst_host', '')
-
-    @property
-    def src_ip(self) -> str:
-        return self.ip_layer['ip.src']
-
-    @property
-    def dst_ip(self) -> str:
-        return self.ip_layer['ip.dst']
-
-    @property
     def raw_headers(self) -> list[dict[str, Any]]:
         return self.raw_http2_substream.get('http2.header', [])
-
-    @property
-    def started_date(self) -> str:
-        frame_time: str = self.frame_layer['frame.time_epoch']
-        return datetime.fromtimestamp(float(frame_time), timezone.utc).isoformat()
 
     def get_time_s(self) -> float:
         return float(self.frame_layer.get('frame.time_epoch', 0))
 
 
-class Http2RequestResponse:
+class Http2RequestResponse(BaseHttpRequestResponse):
     """
     Base class to represent a HTTP2 request or response. It contains the headers and data of the request or response.
     Implements the common properties of a HTTP2 request or response.
     """
-    FALLBACK_CONTENT_TYPE: ClassVar = 'application/octet-stream'
-
     def __init__(self, substreams: list[Http2Substream]):
         self.substreams = substreams
         self.headers, self.data, self.headers_streams, self.data_streams = Http2Helper.get_headers_and_data(substreams)
@@ -93,7 +67,13 @@ class Http2RequestResponse:
         return sum(int(s.raw_http2_substream.get('http2.length', 0)) for s in self.headers_streams)
 
     @property
-    def body_length(self) -> int:
+    def content_type(self) -> str:
+        if not self or not self.data:
+            return ''
+        return self.headers_map.get('content-type', self.FALLBACK_CONTENT_TYPE)
+
+    @property
+    def content_length(self) -> int:
         """
         <!> This is number of compressed bytes (if any compression)
         - `http2.length` is also populated for header substreams
@@ -125,19 +105,13 @@ class Http2RequestResponse:
     def http_method(self) -> str:
         return self.headers_map.get(':method', '')
 
-    @property
-    def content_type(self) -> str:
-        if not self or not self.data:
-            return ''
-        return self.headers_map.get('content-type', self.FALLBACK_CONTENT_TYPE)
-
     def get_duration_ms(self) -> float:
         if not self:
             return -1
         return round(1000 * (self.substreams[-1].get_time_s() - self.substreams[0].get_time_s()), 2)
 
 
-class Http2Request(Http2RequestResponse):
+class Http2Request(Http2RequestResponse, BaseHttpRequest):
     """
     Class to represent a HTTP2 request. It contains the headers and data of the request.
     """
@@ -155,7 +129,7 @@ class Http2Request(Http2RequestResponse):
         return f'Request: {len(self.headers_streams)}h + {len(self.data_streams)}d substreams\n\tURI: {self.uri}\n\tHeaders: {self.headers_map}\n\tData: {self.data}'
 
 
-class Http2Response(Http2RequestResponse):
+class Http2Response(Http2RequestResponse, BaseHttpResponse):
     """
     Class to represent a HTTP2 response. It contains the headers and data of the response.
 
@@ -202,14 +176,14 @@ class Http2Stream:
     def id(self) -> tuple[int, int]:
         return (self.tcp_stream_id, self.http2_stream_id)
 
-    def append(self, raw_http2_substream: dict[str, Any], all_layers: DictLayers) -> None:
+    def append(self, raw_http2_substream: dict[str, Any], full_layers: DictLayers) -> None:
         """
         Append a new substream to the HTTP2 stream.
 
-        :param substream: the substream to be added
-        :param frame: the frame containing the substream. A frame can contain multiple substreams.
+        :param raw_http2_substream: the HTTP2 substream to be added
+        :param full_layers: full layers of frame containing the substream. A frame can contain multiple substreams.
         """
-        self.substreams.append(Http2Substream(raw_http2_substream, all_layers))
+        self.substreams.append(Http2Substream.from_full_layers(raw_http2_substream, full_layers))
 
     @property
     def waiting_duration(self) -> float:
@@ -321,6 +295,7 @@ class Http2Stream:
         req_substreams = [substream for substream in self.substreams if substream.src_ip == src]
         resp_substreams = [substream for substream in self.substreams if substream.src_ip == dst]
         assert len(req_substreams) + len(resp_substreams) == len(self.substreams), self.substreams
+        #TODO: refact this
         self.request = Http2Request(req_substreams)
         self.response = Http2Response(resp_substreams)  # may be empty
 
@@ -380,17 +355,25 @@ class Http2Helper:
             'queryString': [],  # TODO?
             'cookies': [],  # TODO?
             'headersSize': message.header_length,
-            'bodySize': message.body_length,
+            'bodySize': message.content_length,
         }
-        if isinstance(message, Http2Request):
+        if isinstance(message, Http2Request):  # TODO: refact this dirty thing
             entry['method'] = message.http_method
             entry['url'] = message.uri
             if message.data.size:
-                entry['postData'] = {
-                    'mimeType': message.content_type,
-                    **message.data.to_har_dict(),
-                    'params': [],  # TODO?
-                }
+                req_content = message.data.to_har_dict()
+                # <!> HAR Specs do NOT allow us to specify encoding in `request.postData`
+                # (unlike in `response.content`)
+                # thus, we use the HTTPToolkit convention to properly handle such payloads
+                if 'encoding' not in req_content:
+                    entry['postData'] = {
+                        'mimeType': message.content_type,
+                        **req_content,
+                        'params': [],  # exclusive from providing text
+                    }
+                else:
+                    entry['_requestBodyStatus'] = 'discarded:not-representable'
+                    entry['_content'] = req_content
         else:
             entry['status'] = message.http_status
             entry['statusText'] = ''
