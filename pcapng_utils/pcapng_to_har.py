@@ -7,7 +7,7 @@ from argparse import ArgumentParser
 from typing import Any
 
 from pcapng_utils.tshark import Tshark, NetworkTrafficDump
-from pcapng_utils.har.pirogue_enrichment import Stacktrace, ContentDecryption
+from pcapng_utils.har.pirogue_enrichment import HarEnrichment, Stacktrace, ContentDecryption
 
 DEFAULT_TSHARK_PATH = {
     "Linux": "/usr/bin/tshark",
@@ -69,6 +69,28 @@ def cli() -> None:
         raise RuntimeError(args.i) from e
 
 
+def enrich_har_with_io(
+    har_data: dict[str, Any],
+    enricher: type[HarEnrichment],
+    input_dir: Path,
+    input_enrichment_file: Path | str | None,
+    default_enrichment_file: str,
+    logger: logging.Logger,
+) -> bool:
+
+    if input_enrichment_file is None:  # use default Pirogue path
+        input_enrichment_file = input_dir / default_enrichment_file
+        if not input_enrichment_file.is_file():
+            return False
+    else:
+        input_enrichment_file = Path(input_enrichment_file)
+
+    has_been_enriched = enricher(har_data, input_enrichment_file).enrich()
+    logger.info(f"The HAR has been enriched with {enricher.ID} data from {input_enrichment_file}")
+
+    return has_been_enriched
+
+
 def pcapng_to_har(
     input_file: Path | str,
     output_file: Path | str | None = None,
@@ -102,23 +124,24 @@ def pcapng_to_har(
     har_data = traffic.save_har(output_file, overwrite=overwrite, **json_dump_kws)
 
     # Add stacktrace information to the HAR
-    enriched = False  # whether the HAR data has been enriched
-    socket_operations_file = Path(socket_operations_file) if socket_operations_file else None
-    if socket_operations_file and socket_operations_file.is_file():
-        se = Stacktrace(har_data, socket_operations_file)
-        enriched |= se.enrich()
-        logger.info(f"The HAR has been enriched with stacktrace data from {socket_operations_file}")
-    else:
-        logger.warning("Invalid stacktrace data input file, skipping this enrichment")
+    enriched = enrich_har_with_io(
+        har_data,
+        Stacktrace,
+        input_file.parent,
+        socket_operations_file,
+        "socket_trace.json",
+        logger,
+    )
 
     # Add content decryption to the HAR
-    cryptography_operations_file = Path(cryptography_operations_file) if cryptography_operations_file else None
-    if cryptography_operations_file and cryptography_operations_file.is_file():
-        de = ContentDecryption(har_data, cryptography_operations_file)
-        enriched |= de.enrich()
-        logger.info(f"The HAR has been enriched with decrypted content from {cryptography_operations_file}")
-    else:
-        logger.warning("Invalid decryption data input file, skipping this enrichment")
+    enriched |= enrich_har_with_io(
+        har_data,
+        ContentDecryption,
+        input_file.parent,
+        cryptography_operations_file,
+        "aes_info.json",
+        logger,
+    )
 
     # Re-save the enriched HAR data
     if enriched:
