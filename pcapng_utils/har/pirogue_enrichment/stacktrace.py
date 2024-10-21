@@ -38,6 +38,19 @@ class SocketTrace(TypedDict):
 def empty_time_sorted_list_of_stack_traces():
     return SortedKeyList(key=itemgetter('timestamp'))
 
+# cf. https://docs.python.org/3.11/library/bisect.html#searching-sorted-lists
+def get_index_le(lst: SortedKeyList, key: Any) -> int | None:
+    ix: int = lst.bisect_key_right(key) - 1
+    if ix == -1:
+        return None
+    return ix
+
+def get_index_ge(lst: SortedKeyList, key: Any) -> int | None:
+    ix: int = lst.bisect_key_left(key)
+    if ix == len(lst):
+        return None
+    return ix
+
 
 class Stacktrace(HarEnrichment):
 
@@ -45,7 +58,7 @@ class Stacktrace(HarEnrichment):
 
     KEYS_PREFIX: ClassVar = ''
     COMMUNITY_ID: ClassVar = communityid.CommunityID()
-    MAX_DELTA_S: ClassVar[float] = 1.0
+    MAX_DELTA_S: ClassVar[float] = 5.0
     """maximum delay (in seconds) tolerated between socket operation & network traffic for matching them"""
 
     def __init__(self, har_data: dict, input_data_file: Path) -> None:
@@ -109,29 +122,41 @@ class Stacktrace(HarEnrichment):
         return bool(har_directed_entry.get('_timestamp'))
 
     def _find_best_stacktrace(self, community_id: CommunityID, direction: FlowDirection, timestamp: Timestamp) -> SocketTrace | None:
-        """ Find the stacktrace with the closest timestamp (in the past) to the given one matching the community ID """
+        r"""
+        Find the stacktrace with the closest\* timestamp to the given one matching the community ID
+
+        \* (in the past if direction is `out`, in the future if direction was `in`)
+        """
         matching_traces = self.socket_traces_map.get((community_id, direction))
         if not matching_traces:
             logger.warning(f'No stacktrace has been found for {community_id=}, {direction=}')
             return None
-        closest_stack_trace_ix: int = matching_traces.bisect_key_left(timestamp)
-        if closest_stack_trace_ix == len(matching_traces):
-            logger.warning(f'No socket operation prior to {timestamp=} has been found for {community_id=}, {direction=}')
+        if direction == 'out':
+            chronology_label, delay_sign = f'just before {timestamp=}', -1
+            closest_stack_trace_ix = get_index_le(matching_traces, timestamp)
+        else:
+            chronology_label, delay_sign = f'just after {timestamp=}', +1
+            closest_stack_trace_ix = get_index_ge(matching_traces, timestamp)
+        if closest_stack_trace_ix is None:
+            logger.warning(f'No socket operation {chronology_label} has been found for {community_id=}, {direction=}')
             return None
         closest_match: SocketTrace = matching_traces[closest_stack_trace_ix]  # type: ignore
-        delta_sec = timestamp - closest_match['timestamp']
-        if delta_sec > self.MAX_DELTA_S:
-            logger.warning(f'Closest past socket operation < {timestamp=} for {community_id=}, {direction=} is too old')
+        pos_delta_sec = delay_sign * (closest_match['timestamp'] - timestamp)
+        assert pos_delta_sec >= 0, pos_delta_sec
+        if pos_delta_sec > self.MAX_DELTA_S:
+            logger.warning(
+                f'Closest socket operation around {timestamp=} for {community_id=}, {direction=} is too far away ({pos_delta_sec=})'
+            )
             return None
         pairing_key = (community_id, direction, closest_stack_trace_ix)
         already_paired_delta_sec = self.paired_socket_traces.get(pairing_key)
         if already_paired_delta_sec is not None:
             raise NotImplementedError(
                 f"TODO: find best OVERALL allocations of stacktraces under ({community_id=}, {direction=}) instead of FIFO? "
-                f"{delta_sec=}, {already_paired_delta_sec=}, {closest_match['timestamp']=}"
+                f"{pos_delta_sec=}, {already_paired_delta_sec=}, {closest_match['timestamp']=}"
             )
-        self.paired_socket_traces[pairing_key] = delta_sec
-        logger.debug(f'Stacktrace found with ∆t={delta_sec * 1000:.1f}ms, for {community_id=}, {direction=}')
+        self.paired_socket_traces[pairing_key] = pos_delta_sec
+        logger.debug(f'Stacktrace found with ∆t={pos_delta_sec * 1000:.1f}ms, for {community_id=}, {direction=}')
         return closest_match
 
     @staticmethod
