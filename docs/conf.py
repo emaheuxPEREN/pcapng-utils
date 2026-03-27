@@ -30,8 +30,6 @@ autodoc_pydantic_model_member_order = "bysource"
 
 extensions = [
     "myst_parser",
-    "sphinx_toolbox.collapse",
-    "sphinx_toolbox.formatting",
     "sphinx.ext.autodoc",
     "sphinx.ext.autodoc.typehints",
     "sphinx_copybutton",
