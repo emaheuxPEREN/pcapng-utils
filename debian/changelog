@@ -1,3 +1,9 @@
+pcapng-utils (1.1.1) bookworm; urgency=medium
+
+  * Relax: emit a warning and ignore HTTP2 streams that lack a request substream, instead of raising
+
+ -- emaheuxPEREN <contact@peren.gouv.fr> Thu, 23 Apr 2026 19:34:13 +0200
+
 pcapng-utils (1.1.0) bookworm; urgency=medium
 
   * Feat: Support WebSocket protocol
