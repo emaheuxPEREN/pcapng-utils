@@ -1,4 +1,5 @@
 import warnings
+import logging
 from functools import cached_property
 from collections.abc import Set, Sequence, Mapping
 from typing import ClassVar, Optional, Any
@@ -7,6 +8,8 @@ from ...payload import Payload
 from ..types import HarEntry, DictLayers, NameValueDict
 from ..layers import FrameMixin, TCPIPMixin, get_protocols, get_har_communication, get_tcp_stream_id, get_community_id
 from ..utils import get_tshark_bytes_from_raw, har_entry_with_common_fields
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Http2Substream(FrameMixin, TCPIPMixin):
@@ -247,11 +250,10 @@ class Http2Stream:
 
         :return: the HAR entry for the HTTP2 stream
         """
-        assert self.request is not None, self.id
-        assert self.response is not None, self.id
-        if not self.request:
+        if not self.request:  # may happen if we failed to find request among substreams
             assert not self.response, self.id
             return None
+        assert self.response is not None, self.id
         first_stream = self.request.headers_streams[0]
         return har_entry_with_common_fields({
             '_timestamp': first_stream.timestamp,
@@ -332,13 +334,20 @@ class Http2Stream:
             if 'http2.request.full_uri' in substream.raw_http2_substream:  # This is a request
                 src, dst = substream.src_ip_port, substream.dst_ip_port
                 break
-        assert src and dst, self.substreams
-        assert src != dst, src
+        if not (src and dst):
+            LOGGER.warning(
+                f"Ignoring HTTP2 stream {self.id} which is lacking a request, "
+                f"substreams types = {[ss.http2_type for ss in self.substreams]}"
+            )
+            return
+        assert src != dst, (self.id, src)
 
         # Create the request and response objects with their associated substreams
         req_substreams = [substream for substream in self.substreams if substream.src_ip_port == src]
         resp_substreams = [substream for substream in self.substreams if substream.src_ip_port == dst]
-        assert len(req_substreams) + len(resp_substreams) == len(self.substreams), self.substreams
+        assert len(req_substreams) + len(resp_substreams) == len(self.substreams), (
+            self.id, len(self.substreams), len(req_substreams), len(resp_substreams)
+        )
         self.request = Http2Request(req_substreams)
         self.response = Http2Response(resp_substreams)  # may be empty
 
